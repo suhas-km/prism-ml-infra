@@ -1,17 +1,18 @@
 """
-vLLM Inference Engine wrapper with dynamic LoRA adapter loading.
-Hardware-agnostic design with tensor parallelism support.
+HuggingFace Transformers Inference Engine with LoRA adapter support.
+Hardware-agnostic design compatible with ARM64/GH200.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import List, Optional
 
-from vllm import AsyncLLMEngine, SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.lora.request import LoRARequest
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
 
 from ml_platform.config import ResourceConfig, get_config
 from ml_platform.logger import LogContext, get_logger
@@ -21,7 +22,7 @@ logger = get_logger(__name__)
 
 class InferenceEngine:
     """
-    High-throughput inference engine using vLLM's AsyncLLMEngine.
+    Inference engine using HuggingFace Transformers.
     Supports dynamic LoRA adapter loading at inference time.
     """
     
@@ -39,48 +40,93 @@ class InferenceEngine:
         """
         self.config = config or get_config()
         self.model_name = model_name or self.config.model_name
-        self._engine: Optional[AsyncLLMEngine] = None
-        self._lora_counter: int = 0
+        self._model = None
+        self._tokenizer = None
+        self._current_adapter: Optional[str] = None
         
         logger.info(
             "inference_engine_init",
             model=self.model_name,
-            tensor_parallel_size=self.config.tensor_parallel_size,
             device=self.config.device,
         )
     
     async def start(self) -> None:
-        """Start the vLLM engine asynchronously."""
+        """Load the model and tokenizer asynchronously."""
         logger.info("inference_engine_starting", model=self.model_name)
         
-        engine_args = AsyncEngineArgs(
-            model=self.model_name,
-            tensor_parallel_size=self.config.tensor_parallel_size,
-            max_model_len=self.config.max_model_len,
-            enable_lora=True,
-            max_loras=4,
-            max_lora_rank=64,
-            trust_remote_code=True,
-            dtype="auto",
-            gpu_memory_utilization=0.85 if self.config.is_gpu_available else None,
-        )
-        
-        self._engine = AsyncLLMEngine.from_engine_args(engine_args)
+        # Run model loading in thread pool to not block event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._load_model)
         
         logger.info("inference_engine_started", model=self.model_name)
     
+    def _load_model(self) -> None:
+        """Load model and tokenizer (blocking)."""
+        device = self.config.device
+        
+        # Load tokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name,
+            trust_remote_code=True,
+        )
+        if self._tokenizer.pad_token is None:
+            self._tokenizer.pad_token = self._tokenizer.eos_token
+        
+        # Configure model loading
+        model_kwargs = {
+            "trust_remote_code": True,
+            "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+        }
+        
+        if device == "cuda":
+            model_kwargs["device_map"] = "auto"
+        
+        # Load model
+        self._model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            **model_kwargs,
+        )
+        
+        if device == "cpu":
+            self._model = self._model.to(device)
+        
+        self._model.eval()
+    
     async def stop(self) -> None:
-        """Stop the vLLM engine and release resources."""
+        """Unload model and release resources."""
         logger.info("inference_engine_stopping")
-        if self._engine is not None:
-            # vLLM handles cleanup internally
-            self._engine = None
+        if self._model is not None:
+            del self._model
+            self._model = None
+        if self._tokenizer is not None:
+            del self._tokenizer
+            self._tokenizer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         logger.info("inference_engine_stopped")
     
     @property
     def is_ready(self) -> bool:
         """Check if the engine is ready to serve requests."""
-        return self._engine is not None
+        return self._model is not None and self._tokenizer is not None
+    
+    def _load_adapter(self, adapter_path: str) -> None:
+        """Load a LoRA adapter onto the base model."""
+        if self._current_adapter == adapter_path:
+            return
+        
+        # Unload current adapter if any
+        if self._current_adapter is not None and hasattr(self._model, 'unload'):
+            self._model = self._model.unload()
+        
+        # Load new adapter
+        self._model = PeftModel.from_pretrained(
+            self._model,
+            adapter_path,
+            is_trainable=False,
+        )
+        self._current_adapter = adapter_path
+        logger.info("lora_adapter_loaded", adapter_path=adapter_path)
     
     async def predict(
         self,
@@ -108,7 +154,7 @@ class InferenceEngine:
         Raises:
             RuntimeError: If engine is not initialized
         """
-        if self._engine is None:
+        if not self.is_ready:
             raise RuntimeError("Inference engine not started. Call start() first.")
         
         request_id = str(uuid.uuid4())
@@ -121,67 +167,108 @@ class InferenceEngine:
                 max_tokens=max_tokens,
             )
             
+            # Load adapter if specified
+            if adapter_path is not None:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._load_adapter, adapter_path)
+            
             start_time = time.perf_counter()
             
-            # Configure sampling parameters
-            sampling_params = SamplingParams(
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop_sequences,
+            # Run generation in thread pool
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                self._generate_sync,
+                prompt,
+                max_tokens,
+                temperature,
+                top_p,
+                stop_sequences,
             )
-            
-            # Configure LoRA request if adapter path provided
-            lora_request: Optional[LoRARequest] = None
-            if adapter_path is not None:
-                self._lora_counter += 1
-                lora_request = LoRARequest(
-                    lora_name=f"adapter_{self._lora_counter}",
-                    lora_int_id=self._lora_counter,
-                    lora_path=adapter_path,
-                )
-                logger.info("lora_adapter_loading", adapter_path=adapter_path)
-            
-            # Generate response
-            generated_text = ""
-            tokens_generated = 0
-            finish_reason = "unknown"
-            
-            async for output in self._engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                request_id=request_id,
-                lora_request=lora_request,
-            ):
-                if output.finished:
-                    if output.outputs:
-                        generated_text = output.outputs[0].text
-                        tokens_generated = len(output.outputs[0].token_ids)
-                        finish_reason = output.outputs[0].finish_reason or "stop"
             
             elapsed_ms = (time.perf_counter() - start_time) * 1000
             
             logger.info(
                 "predict_complete",
-                tokens_generated=tokens_generated,
+                tokens_generated=result["tokens_generated"],
                 latency_ms=round(elapsed_ms, 2),
-                finish_reason=finish_reason,
+                finish_reason=result["finish_reason"],
             )
             
             return {
                 "request_id": request_id,
                 "prompt": prompt,
-                "generated_text": generated_text,
-                "tokens_generated": tokens_generated,
-                "finish_reason": finish_reason,
+                "generated_text": result["generated_text"],
+                "tokens_generated": result["tokens_generated"],
+                "finish_reason": result["finish_reason"],
                 "latency_ms": round(elapsed_ms, 2),
             }
+    
+    def _generate_sync(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop_sequences: Optional[List[str]],
+    ) -> dict:
+        """Synchronous generation (runs in thread pool)."""
+        # Tokenize input
+        inputs = self._tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_model_len - max_tokens,
+        )
+        
+        # Move to device
+        device = next(self._model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        input_length = inputs["input_ids"].shape[1]
+        
+        # Generate
+        with torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature if temperature > 0 else 1.0,
+                top_p=top_p,
+                do_sample=temperature > 0,
+                pad_token_id=self._tokenizer.pad_token_id,
+                eos_token_id=self._tokenizer.eos_token_id,
+            )
+        
+        # Decode output (only new tokens)
+        generated_ids = outputs[0][input_length:]
+        generated_text = self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        tokens_generated = len(generated_ids)
+        
+        # Determine finish reason
+        finish_reason = "length"
+        if tokens_generated < max_tokens:
+            if generated_ids[-1].item() == self._tokenizer.eos_token_id:
+                finish_reason = "stop"
+        
+        # Check for stop sequences
+        if stop_sequences:
+            for seq in stop_sequences:
+                if seq in generated_text:
+                    generated_text = generated_text.split(seq)[0]
+                    finish_reason = "stop"
+                    break
+        
+        return {
+            "generated_text": generated_text,
+            "tokens_generated": tokens_generated,
+            "finish_reason": finish_reason,
+        }
     
     async def health_check(self) -> dict:
         """Check engine health status."""
         return {
             "ready": self.is_ready,
             "model": self.model_name,
-            "tensor_parallel_size": self.config.tensor_parallel_size,
             "device": self.config.device,
         }
