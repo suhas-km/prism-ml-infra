@@ -1,6 +1,6 @@
 # Distributed LLM Platform
 
-A production-grade distributed LLM platform orchestrated by **Ray**, supporting high-throughput inference via **vLLM** and distributed fine-tuning with **LoRA/PEFT**.
+A production-grade distributed LLM platform orchestrated by **Ray**, supporting inference via **HuggingFace Transformers** and distributed fine-tuning with **LoRA/PEFT**. Compatible with ARM64/GH200 architectures.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ A production-grade distributed LLM platform orchestrated by **Ray**, supporting 
   ├── /schemas
   │   └── payload.py      # Pydantic models for API contracts
   ├── /core
-  │   ├── inference.py    # vLLM AsyncLLMEngine wrapper
+  │   ├── inference.py    # HuggingFace Transformers inference engine
   │   └── trainer.py      # Ray Actor for SFT with LoRA
   ├── /api
   │   └── routes.py       # FastAPI router definitions
@@ -21,7 +21,7 @@ A production-grade distributed LLM platform orchestrated by **Ray**, supporting 
 ## Features
 
 - **Dynamic Resource Allocation**: Automatically detects available GPUs and allocates between inference/training
-- **High-Throughput Inference**: vLLM with tensor parallelism and request batching
+- **HuggingFace Transformers Inference**: Compatible with ARM64/GH200 and standard x86 architectures
 - **Dynamic LoRA Loading**: Load adapters at inference time without restarting
 - **Distributed Training**: Ray actors for parallel fine-tuning jobs
 - **Structured Logging**: JSON logs with job context for observability
@@ -37,7 +37,7 @@ pip install -r requirements.txt
 ### 2. Set Environment Variables (Optional)
 
 ```bash
-export MODEL_NAME="meta-llama/Llama-2-7b-hf"
+export MODEL_NAME="TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Default model (non-gated)
 export MAX_MODEL_LEN=4096
 export SERVE_HOST="0.0.0.0"
 export SERVE_PORT=8000
@@ -51,11 +51,7 @@ export TRAINING_GPU_FRACTION=0.4
 python -m ml_platform.main
 ```
 
-Or with Ray Serve directly:
-
-```bash
-serve run ml_platform.main:create_app --host 0.0.0.0 --port 8000
-```
+The platform will automatically detect available GPUs and configure the inference engine accordingly.
 
 ## API Endpoints
 
@@ -134,7 +130,7 @@ The platform automatically detects hardware via `ray.cluster_resources()`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `MODEL_NAME` | `meta-llama/Llama-2-7b-hf` | Base model for inference |
+| `MODEL_NAME` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Base model for inference (non-gated) |
 | `MAX_MODEL_LEN` | `4096` | Maximum sequence length |
 | `INFERENCE_GPU_FRACTION` | `0.6` | Fraction of GPUs for inference |
 | `TRAINING_GPU_FRACTION` | `0.4` | Fraction of GPUs for training |
@@ -186,11 +182,7 @@ Logs are output as structured JSON:
 
 ### Multi-GPU Inference
 
-Tensor parallelism is automatically configured based on available GPUs:
-
-```python
-tensor_parallel_size = config.inference_gpus
-```
+The inference engine automatically uses `device_map="auto"` for multi-GPU distribution when CUDA is available.
 
 ### Multi-Node Training
 
