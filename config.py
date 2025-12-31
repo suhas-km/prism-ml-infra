@@ -18,7 +18,7 @@ class ResourceConfig:
     """Dynamic resource configuration based on Ray cluster state."""
     
     # Model configuration
-    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "meta-llama/Llama-2-7b-hf"))
+    model_name: str = field(default_factory=lambda: os.getenv("MODEL_NAME", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"))
     max_model_len: int = field(default_factory=lambda: int(os.getenv("MAX_MODEL_LEN", "4096")))
     
     # Resource allocation fractions
