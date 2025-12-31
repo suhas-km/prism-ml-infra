@@ -58,6 +58,14 @@ class JobRegistry:
         return len(self._jobs)
 
 
+# Create FastAPI app instance
+app = FastAPI(
+    title="Distributed LLM Platform",
+    description="High-throughput inference and distributed fine-tuning platform",
+    version="1.0.0",
+)
+
+
 @serve.deployment(
     name="ml_platform",
     ray_actor_options={"num_cpus": 1},
@@ -67,11 +75,7 @@ class JobRegistry:
         "target_ongoing_requests": 10,
     },
 )
-@serve.ingress(FastAPI(
-    title="Distributed LLM Platform",
-    description="High-throughput inference and distributed fine-tuning platform",
-    version="1.0.0",
-))
+@serve.ingress(app)
 class MLPlatformDeployment:
     """
     Ray Serve deployment combining inference and training orchestration.
@@ -127,7 +131,7 @@ class MLPlatformDeployment:
     
     # ========== API Endpoints ==========
     
-    @serve.app.get("/health", response_model=HealthResponse, tags=["System"])
+    @app.get("/health", response_model=HealthResponse, tags=["System"])
     async def health_check(self) -> HealthResponse:
         """Health check endpoint with system status."""
         self.config.refresh()
@@ -140,7 +144,7 @@ class MLPlatformDeployment:
             active_training_jobs=self.job_registry.active_count,
         )
     
-    @serve.app.post("/chat", response_model=ChatResponse, tags=["Inference"])
+    @app.post("/chat", response_model=ChatResponse, tags=["Inference"])
     async def chat(self, request: ChatRequest) -> ChatResponse:
         """Generate text completion for the given prompt."""
         await self._ensure_initialized()
@@ -177,7 +181,7 @@ class MLPlatformDeployment:
                 detail=f"Inference failed: {str(e)}",
             )
     
-    @serve.app.post("/fine-tune", response_model=FineTuneResponse, tags=["Training"])
+    @app.post("/fine-tune", response_model=FineTuneResponse, tags=["Training"])
     async def fine_tune(self, request: FineTuneRequest) -> FineTuneResponse:
         """
         Start a fine-tuning job.
@@ -235,7 +239,7 @@ class MLPlatformDeployment:
                 detail=f"Failed to start training job: {str(e)}",
             )
     
-    @serve.app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
+    @app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
     async def get_job_status(self, job_id: str) -> JobStatusResponse:
         """Get the status of a fine-tuning job."""
         actor = self.job_registry.get(job_id)
@@ -268,7 +272,7 @@ class MLPlatformDeployment:
                 detail=f"Job {job_id} actor has terminated",
             )
     
-    @serve.app.delete("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
+    @app.delete("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
     async def cancel_job(self, job_id: str) -> JobStatusResponse:
         """Cancel a running fine-tuning job."""
         actor = self.job_registry.get(job_id)
@@ -303,7 +307,7 @@ class MLPlatformDeployment:
                 detail=f"Job {job_id} actor has terminated",
             )
     
-    @serve.app.get("/jobs", tags=["Training"])
+    @app.get("/jobs", tags=["Training"])
     async def list_jobs(self) -> Dict[str, Any]:
         """List all registered training jobs."""
         jobs = []
