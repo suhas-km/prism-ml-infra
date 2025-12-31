@@ -1,16 +1,23 @@
 """
 Ray Serve entrypoint and resource orchestrator.
 Manages inference engine deployment and training job scheduling.
+
+Compatibility notes:
+- Ray Serve 2.9+: Use @serve.ingress(app) with FastAPI app defined separately
+- Ray Serve 2.10+: serve.start() with http_options for host/port config
+- vLLM 0.11+: AsyncLLMEngine API changes
 """
 
 from __future__ import annotations
 
+import signal
+import sys
 import uuid
-from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
 import ray
 from fastapi import FastAPI, HTTPException, status
+from packaging import version
 from ray import serve
 
 from ml_platform.config import ResourceConfig, get_config
@@ -28,6 +35,10 @@ from ml_platform.schemas.payload import (
 )
 
 logger = get_logger(__name__)
+
+# Version compatibility checks
+RAY_VERSION = version.parse(ray.__version__)
+SERVE_V2_10_PLUS = RAY_VERSION >= version.parse("2.10.0")
 
 
 class JobRegistry:
@@ -58,20 +69,19 @@ class JobRegistry:
         return len(self._jobs)
 
 
-@serve.deployment(
-    name="ml_platform",
-    ray_actor_options={"num_cpus": 1},
-    autoscaling_config={
-        "min_replicas": 1,
-        "max_replicas": 4,
-        "target_ongoing_requests": 10,
-    },
-)
-@serve.ingress(FastAPI(
+# Create FastAPI app at module level for Ray Serve 2.10+ compatibility
+app = FastAPI(
     title="Distributed LLM Platform",
     description="High-throughput inference and distributed fine-tuning platform",
     version="1.0.0",
-))
+)
+
+
+@serve.deployment(
+    name="ml_platform",
+    ray_actor_options={"num_cpus": 1},
+)
+@serve.ingress(app)
 class MLPlatformDeployment:
     """
     Ray Serve deployment combining inference and training orchestration.
@@ -127,7 +137,7 @@ class MLPlatformDeployment:
     
     # ========== API Endpoints ==========
     
-    @serve.app.get("/health", response_model=HealthResponse, tags=["System"])
+    @app.get("/health", response_model=HealthResponse, tags=["System"])
     async def health_check(self) -> HealthResponse:
         """Health check endpoint with system status."""
         self.config.refresh()
@@ -140,7 +150,7 @@ class MLPlatformDeployment:
             active_training_jobs=self.job_registry.active_count,
         )
     
-    @serve.app.post("/chat", response_model=ChatResponse, tags=["Inference"])
+    @app.post("/chat", response_model=ChatResponse, tags=["Inference"])
     async def chat(self, request: ChatRequest) -> ChatResponse:
         """Generate text completion for the given prompt."""
         await self._ensure_initialized()
@@ -177,7 +187,7 @@ class MLPlatformDeployment:
                 detail=f"Inference failed: {str(e)}",
             )
     
-    @serve.app.post("/fine-tune", response_model=FineTuneResponse, tags=["Training"])
+    @app.post("/fine-tune", response_model=FineTuneResponse, tags=["Training"])
     async def fine_tune(self, request: FineTuneRequest) -> FineTuneResponse:
         """
         Start a fine-tuning job.
@@ -235,7 +245,7 @@ class MLPlatformDeployment:
                 detail=f"Failed to start training job: {str(e)}",
             )
     
-    @serve.app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
+    @app.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
     async def get_job_status(self, job_id: str) -> JobStatusResponse:
         """Get the status of a fine-tuning job."""
         actor = self.job_registry.get(job_id)
@@ -268,7 +278,7 @@ class MLPlatformDeployment:
                 detail=f"Job {job_id} actor has terminated",
             )
     
-    @serve.app.delete("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
+    @app.delete("/jobs/{job_id}", response_model=JobStatusResponse, tags=["Training"])
     async def cancel_job(self, job_id: str) -> JobStatusResponse:
         """Cancel a running fine-tuning job."""
         actor = self.job_registry.get(job_id)
@@ -303,7 +313,7 @@ class MLPlatformDeployment:
                 detail=f"Job {job_id} actor has terminated",
             )
     
-    @serve.app.get("/jobs", tags=["Training"])
+    @app.get("/jobs", tags=["Training"])
     async def list_jobs(self) -> Dict[str, Any]:
         """List all registered training jobs."""
         jobs = []
@@ -344,19 +354,44 @@ def main() -> None:
         training_gpus=config.training_gpus,
         host=config.serve_host,
         port=config.serve_port,
+        ray_version=ray.__version__,
     )
     
-    # Deploy the application
-    serve.run(
-        create_app(),
-        host=config.serve_host,
-        port=config.serve_port,
-    )
+    # Deploy the application with version-compatible API
+    if SERVE_V2_10_PLUS:
+        # Ray Serve 2.10+: Use serve.start() with http_options
+        serve.start(http_options={"host": config.serve_host, "port": config.serve_port})
+        serve.run(create_app(), name="ml_platform")
+    else:
+        # Ray Serve 2.9.x: Use serve.run() with host/port directly
+        serve.run(
+            create_app(),
+            host=config.serve_host,
+            port=config.serve_port,
+        )
     
     logger.info(
         "ml_platform_running",
         url=f"http://{config.serve_host}:{config.serve_port}",
     )
+    
+    # Graceful shutdown handler
+    def signal_handler(sig, frame):
+        logger.info("shutdown_requested")
+        serve.shutdown()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Keep process alive
+    import time
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        logger.info("keyboard_interrupt_received")
+        serve.shutdown()
 
 
 if __name__ == "__main__":
