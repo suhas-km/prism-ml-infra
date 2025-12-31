@@ -351,11 +351,8 @@ def main() -> None:
     )
     
     # Deploy the application
-    serve.run(
-        create_app(),
-        host=config.serve_host,
-        port=config.serve_port,
-    )
+    serve.start(http_options={"host": config.serve_host, "port": config.serve_port})
+    serve.run(create_app())
     
     logger.info(
         "ml_platform_running",
